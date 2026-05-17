@@ -13,92 +13,100 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Process markdown files
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Process markdown files and create gists
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          #!/bin/bash
+          import os
+          import json
+          import requests
+          from datetime import datetime
           
-          # Create arrays to store gist URLs
-          declare -a GIST_URLS
-          GIST_COUNT=0
-          
-          # Check if import folder exists
-          if [ ! -d "import" ]; then
-            echo "No import folder found"
-            exit 0
-          fi
+          github_token = os.environ['GITHUB_TOKEN']
+          headers = {
+              'Authorization': f'token {github_token}',
+              'Accept': 'application/vnd.github.v3+json'
+          }
           
           # Create done folder if it doesn't exist
-          mkdir -p done
+          os.makedirs('done', exist_ok=True)
+          
+          gist_urls = []
+          
+          # Check if import folder exists
+          if not os.path.exists('import'):
+              print("No import folder found")
+              exit(0)
           
           # Process each .md file in import folder
-          for file in import/*.md; do
-            if [ -f "$file" ]; then
-              echo "Processing: $file"
-              
-              # Get filename without extension
-              filename=$(basename "$file" .md)
-              
-              # Read file content
-              content=$(<"$file")
-              
-              # Create gist using GitHub API
-              gist_response=$(curl -s -X POST https://api.github.com/gists \
-                -H "Authorization: token $GITHUB_TOKEN" \
-                -H "Accept: application/vnd.github.v3+json" \
-                -d "{
-                  \"description\": \"$filename\",
-                  \"public\": true,
-                  \"files\": {
-                    \"$filename.md\": {
-                      \"content\": $(echo "$content" | jq -R -s '.')
-                    }
+          for filename in os.listdir('import'):
+              if filename.endswith('.md'):
+                  filepath = os.path.join('import', filename)
+                  print(f"Processing: {filepath}")
+                  
+                  # Read file content
+                  with open(filepath, 'r', encoding='utf-8') as f:
+                      content = f.read()
+                  
+                  # Create gist using GitHub API
+                  gist_data = {
+                      'description': filename,
+                      'public': True,
+                      'files': {
+                          filename: {
+                              'content': content
+                          }
+                      }
                   }
-                }")
-              
-              # Extract gist URL
-              gist_url=$(echo "$gist_response" | jq -r '.html_url // empty')
-              
-              if [ -n "$gist_url" ]; then
-                echo "Created gist: $gist_url"
-                GIST_URLS+=("$gist_url")
-                GIST_COUNT=$((GIST_COUNT + 1))
-                
-                # Move file to done folder
-                mv "$file" "done/$filename.md"
-                echo "Moved to done folder"
-              else
-                echo "Failed to create gist for $file"
-                echo "Response: $gist_response"
-              fi
-            fi
-          done
+                  
+                  response = requests.post(
+                      'https://api.github.com/gists',
+                      headers=headers,
+                      json=gist_data
+                  )
+                  
+                  if response.status_code == 201:
+                      gist_url = response.json()['html_url']
+                      print(f"Created gist: {gist_url}")
+                      gist_urls.append(gist_url)
+                      
+                      # Move file to done folder
+                      os.rename(filepath, os.path.join('done', filename))
+                      print(f"Moved {filename} to done folder")
+                  else:
+                      print(f"Failed to create gist for {filename}")
+                      print(f"Status: {response.status_code}")
+                      print(f"Response: {response.text}")
           
           # Create gist list file
-          if [ $GIST_COUNT -gt 0 ]; then
-            {
-              echo "# Gists Created on $(date)"
-              echo ""
-              for url in "${GIST_URLS[@]}"; do
-                echo "- $url"
-              done
-            } > gist_list.txt
-            
-            echo "Created gist_list.txt with $GIST_COUNT gists"
-          else
-            echo "No gists created"
-          fi
+          if gist_urls:
+              with open('gist_list.txt', 'w') as f:
+                  f.write(f"# Gists Created on {datetime.now()}\n\n")
+                  for url in gist_urls:
+                      f.write(f"- {url}\n")
+              
+              print(f"Created gist_list.txt with {len(gist_urls)} gists")
+          else:
+              print("No gists created")
+        shell: python
 
       - name: Commit and push changes
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           
+          git add -A
+          git status
+          
           if [ -n "$(git status --porcelain)" ]; then
-            git add -A
             git commit -m "Process markdown files to gists [skip ci]"
             git push
+            echo "Changes pushed successfully"
           else
             echo "No changes to commit"
           fi
