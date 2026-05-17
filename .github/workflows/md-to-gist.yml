@@ -3,110 +3,105 @@ name: Convert Markdown to Gists
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   process-markdown:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
+      - name: Ensure jq is installed
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
 
-      - name: Process markdown files and create gists
+      - name: Create gists from import/*.md and move files
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          #!/bin/bash
+          set -euo pipefail
+          shopt -s nullglob
+
+          if [ -z "${GIST_TOKEN:-}" ]; then
+            echo "ERROR: GIST_TOKEN secret is not set. Create a PAT with gist scope and add it as repo secret GIST_TOKEN."
+            exit 1
+          fi
+
+          mkdir -p done
+          GIST_URLS=()
+
+          for file in import/*.md; do
+            [ -f "$file" ] || continue
+            filename="$(basename "$file")"
+            echo "Processing: $filename"
+
+            # Read file content (preserve newlines)
+            content="$(cat "$file")"
+
+            # Build safe JSON payload with jq to escape content properly
+            payload=$(jq -n --arg desc "$filename" --arg fname "$filename" --arg content "$content" \
+              '{description: $desc, public: true, files: { ($fname): { content: $content }}}')
+
+            # POST to create gist; capture body and http status
+            response=$(curl -s -w "\n%{http_code}" -X POST \
+              -H "Authorization: token ${GIST_TOKEN}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -d "$payload" \
+              https://api.github.com/gists)
+
+            http_code=$(echo "$response" | tail -n1)
+            body=$(echo "$response" | sed '$d')
+
+            if [ "$http_code" = "201" ]; then
+              gist_url=$(echo "$body" | jq -r '.html_url')
+              echo "Created gist: $gist_url"
+              GIST_URLS+=("$gist_url")
+              mv "$file" "done/$filename"
+              echo "Moved $filename -> done/$filename"
+            else
+              echo "Failed to create gist for $filename (HTTP $http_code)"
+              echo "Response body:"
+              echo "$body"
+              # keep the file in import/ for debugging/retry
+            fi
+          done
+
+          # Always write gist_list.txt (may be empty)
+          {
+            echo "# Gists Created on $(date -u +"%Y-%m-%d %H:%M:%SZ")"
+            echo ""
+            for url in "${GIST_URLS[@]}"; do
+              echo "- $url"
+            done
+          } > gist_list.txt
+
+          echo "---- gist_list.txt ----"
+          cat gist_list.txt
+          echo "-----------------------"
+
+      - name: Commit and push done/ and gist_list.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          import os
-          import json
-          import requests
-          from datetime import datetime
-          
-          github_token = os.environ['GITHUB_TOKEN']
-          headers = {
-              'Authorization': f'token {github_token}',
-              'Accept': 'application/vnd.github.v3+json'
-          }
-          
-          # Create done folder if it doesn't exist
-          os.makedirs('done', exist_ok=True)
-          
-          gist_urls = []
-          
-          # Check if import folder exists
-          if not os.path.exists('import'):
-              print("No import folder found")
-              exit(0)
-          
-          # Process each .md file in import folder
-          for filename in os.listdir('import'):
-              if filename.endswith('.md'):
-                  filepath = os.path.join('import', filename)
-                  print(f"Processing: {filepath}")
-                  
-                  # Read file content
-                  with open(filepath, 'r', encoding='utf-8') as f:
-                      content = f.read()
-                  
-                  # Create gist using GitHub API
-                  gist_data = {
-                      'description': filename,
-                      'public': True,
-                      'files': {
-                          filename: {
-                              'content': content
-                          }
-                      }
-                  }
-                  
-                  response = requests.post(
-                      'https://api.github.com/gists',
-                      headers=headers,
-                      json=gist_data
-                  )
-                  
-                  if response.status_code == 201:
-                      gist_url = response.json()['html_url']
-                      print(f"Created gist: {gist_url}")
-                      gist_urls.append(gist_url)
-                      
-                      # Move file to done folder
-                      os.rename(filepath, os.path.join('done', filename))
-                      print(f"Moved {filename} to done folder")
-                  else:
-                      print(f"Failed to create gist for {filename}")
-                      print(f"Status: {response.status_code}")
-                      print(f"Response: {response.text}")
-          
-          # Create gist list file
-          if gist_urls:
-              with open('gist_list.txt', 'w') as f:
-                  f.write(f"# Gists Created on {datetime.now()}\n\n")
-                  for url in gist_urls:
-                      f.write(f"- {url}\n")
-              
-              print(f"Created gist_list.txt with {len(gist_urls)} gists")
-          else:
-              print("No gists created")
-        shell: python
-
-      - name: Commit and push changes
-        run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          
-          git add -A
-          git status
-          
+
+          # Stage only the files we changed/created
+          git add -A done gist_list.txt || true
+
           if [ -n "$(git status --porcelain)" ]; then
-            git commit -m "Process markdown files to gists [skip ci]"
-            git push
-            echo "Changes pushed successfully"
+            git commit -m "Process markdown files to gists [skip ci]" || true
+
+            # Use GITHUB_TOKEN for authentication when pushing
+            repo="https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+            git remote set-url origin "$repo"
+            git push origin HEAD
+            echo "Pushed changes"
           else
             echo "No changes to commit"
           fi
