@@ -1,0 +1,110 @@
+name: Convert Markdown to Gists
+
+on:
+  workflow_dispatch:
+
+jobs:
+  process-markdown:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      gists: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Process markdown files
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          #!/bin/bash
+          
+          # Create arrays to store gist URLs
+          declare -a GIST_URLS
+          GIST_COUNT=0
+          
+          # Check if import folder exists
+          if [ ! -d "import" ]; then
+            echo "No import folder found"
+            exit 0
+          fi
+          
+          # Create done folder if it doesn't exist
+          mkdir -p done
+          
+          # Process each .md file in import folder
+          for file in import/*.md; do
+            if [ -f "$file" ]; then
+              echo "Processing: $file"
+              
+              # Get filename without extension
+              filename=$(basename "$file" .md)
+              
+              # Read file content
+              content=$(<"$file")
+              
+              # Create gist using GitHub API
+              gist_response=$(curl -s -X POST https://api.github.com/gists \
+                -H "Authorization: token $GITHUB_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                -d "{
+                  \"description\": \"$filename\",
+                  \"public\": true,
+                  \"files\": {
+                    \"$filename.md\": {
+                      \"content\": $(echo "$content" | jq -R -s '.')
+                    }
+                  }
+                }")
+              
+              # Extract gist URL
+              gist_url=$(echo "$gist_response" | jq -r '.html_url // empty')
+              
+              if [ -n "$gist_url" ]; then
+                echo "Created gist: $gist_url"
+                GIST_URLS+=("$gist_url")
+                GIST_COUNT=$((GIST_COUNT + 1))
+                
+                # Move file to done folder
+                mv "$file" "done/$filename.md"
+                echo "Moved to done folder"
+              else
+                echo "Failed to create gist for $file"
+                echo "Response: $gist_response"
+              fi
+            fi
+          done
+          
+          # Create gist list file
+          if [ $GIST_COUNT -gt 0 ]; then
+            {
+              echo "# Gists Created on $(date)"
+              echo ""
+              for url in "${GIST_URLS[@]}"; do
+                echo "- $url"
+              done
+            } > gist_list.txt
+            
+            echo "Created gist_list.txt with $GIST_COUNT gists"
+          else
+            echo "No gists created"
+          fi
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "Process markdown files to gists [skip ci]"
+            git push
+          else
+            echo "No changes to commit"
+          fi
